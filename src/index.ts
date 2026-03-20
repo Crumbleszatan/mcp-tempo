@@ -98,8 +98,12 @@ function getBearerToken(req: Request): string | null {
 
 // --- Resolve Tempo access token from request ---
 async function resolveTempoToken(req: Request, res: Response): Promise<string | null> {
-  const bearerToken = getBearerToken(req);
   const staticToken = process.env.TEMPO_API_TOKEN;
+
+  // In single-tenant mode (TEMPO_API_TOKEN set), skip auth check
+  if (staticToken) return staticToken;
+
+  const bearerToken = getBearerToken(req);
 
   if (bearerToken) {
     const session = getSession(bearerToken);
