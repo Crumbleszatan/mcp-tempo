@@ -99,6 +99,12 @@ app.use((_req, res, next) => {
 });
 app.options("/{*splat}", (_req, res) => res.sendStatus(204));
 
+// Log all requests
+app.use((req, _res, next) => {
+  console.error(`[HTTP] ${req.method} ${req.url}`);
+  next();
+});
+
 // --- MCP OAuth auth routes (/.well-known/*, /authorize, /token, /register) ---
 app.use(
   mcpAuthRouter({
