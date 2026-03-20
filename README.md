@@ -1,100 +1,102 @@
 # mcp-tempo-oauth
 
-MCP server for the Tempo time tracking API with **OAuth 2.0** authentication.
+Remote MCP server for the Tempo time tracking API with **OAuth 2.0** authentication.
 
-## Setup
+Deployable on Railway, Fly.io, Render, or any Docker host.
 
-### 1. Install
-
-```bash
-npm install
-npm run build
-```
-
-### 2. Create OAuth Application in Tempo
-
-1. Go to **Tempo > Settings > Data Access > OAuth 2.0 Applications**
-2. Click **Add Application**
-3. Set:
-   - **Name**: `mcp-tempo-oauth`
-   - **Redirect URL**: `http://localhost:9876/oauth/callback`
-   - **Grant Type**: Authorization code
-4. Copy the generated **Client ID** and **Client Secret**
-
-### 3. Configure Environment
+## Quick Start (Local)
 
 ```bash
-export TEMPO_CLIENT_ID="your-client-id"
-export TEMPO_CLIENT_SECRET="your-client-secret"
-export TEMPO_JIRA_INSTANCE="your-instance"  # e.g. "mycompany" for mycompany.atlassian.net
+npm install && npm run build
+TEMPO_API_TOKEN=your-token npm start
+# Server running on http://localhost:3000
 ```
 
-Optional variables:
-- `TEMPO_BASE_URL` — API base URL (default: `https://api.tempo.io`)
-- `TEMPO_REDIRECT_PORT` — Callback port (default: `9876`)
-- `TEMPO_TOKEN_FILE` — Custom token storage path (default: `~/.tempo-tokens.json`)
+## Deploy on Railway
 
-### 4. Authenticate
+1. Connect your GitHub repo on [railway.app](https://railway.app)
+2. Set environment variables:
+   - `TEMPO_CLIENT_ID` — from Tempo OAuth app
+   - `TEMPO_CLIENT_SECRET` — from Tempo OAuth app
+   - `TEMPO_JIRA_INSTANCE` — e.g. `support-madagence`
+   - `PUBLIC_URL` — your Railway URL (e.g. `https://mcp-tempo-production.up.railway.app`)
+3. Deploy — Railway auto-detects the Dockerfile
 
-```bash
-npm run auth
-```
+## OAuth Setup
 
-This opens a browser-based OAuth flow:
-1. Opens authorization URL
-2. You authorize in Tempo/Atlassian
-3. Callback receives tokens
-4. Tokens saved to `~/.tempo-tokens.json`
+### 1. Create OAuth app in Tempo
 
-### 5. Run the MCP Server
+Tempo > Settings > Data Access > OAuth 2.0 Applications:
+- **Redirect URL**: `https://your-app.railway.app/oauth/callback`
+- **Client type**: Confidential
+- **Grant type**: Authorization code
 
-```bash
-npm start
-```
+### 2. Authorize
 
-## Claude Desktop / Claude Code Configuration
+Visit `https://your-app.railway.app/oauth/authorize` in your browser. After authorizing, you'll receive a **session token**.
+
+### 3. Connect Claude Desktop
 
 ```json
 {
   "mcpServers": {
     "tempo": {
-      "command": "node",
-      "args": ["/path/to/mcp-tempo-oauth/dist/index.js"],
-      "env": {
-        "TEMPO_CLIENT_ID": "your-client-id",
-        "TEMPO_CLIENT_SECRET": "your-client-secret",
-        "TEMPO_JIRA_INSTANCE": "your-instance"
+      "type": "streamable-http",
+      "url": "https://your-app.railway.app/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_SESSION_TOKEN"
       }
     }
   }
 }
 ```
 
-## Legacy Mode (API Token)
+## API Endpoints
 
-Still supported as fallback. Set `TEMPO_API_TOKEN` instead of OAuth variables:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Health check |
+| `/mcp` | POST/GET/DELETE | MCP protocol (Streamable HTTP) |
+| `/oauth/authorize` | GET | Start OAuth flow |
+| `/oauth/callback` | GET | OAuth callback (receives tokens) |
+| `/oauth/status` | GET | Check session status |
+
+## Single-Tenant Mode (API Token)
+
+For simple setups without OAuth, set `TEMPO_API_TOKEN`:
 
 ```json
 {
   "mcpServers": {
     "tempo": {
-      "command": "node",
-      "args": ["/path/to/mcp-tempo-oauth/dist/index.js"],
-      "env": {
-        "TEMPO_API_TOKEN": "your-static-token"
+      "type": "streamable-http",
+      "url": "https://your-app.railway.app/mcp",
+      "headers": {
+        "Authorization": "Bearer any-value"
       }
     }
   }
 }
 ```
 
-## Token Refresh
+Note: In this mode, the Bearer token is ignored and the static `TEMPO_API_TOKEN` is used for all requests.
 
-Access tokens are **automatically refreshed** when they expire. The refresh happens transparently during API calls — no user intervention needed. Updated tokens are persisted to disk.
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TEMPO_CLIENT_ID` | For OAuth | OAuth client ID |
+| `TEMPO_CLIENT_SECRET` | For OAuth | OAuth client secret |
+| `TEMPO_JIRA_INSTANCE` | For OAuth | Jira Cloud instance name |
+| `PUBLIC_URL` | For deploy | Public URL of the server |
+| `TEMPO_API_TOKEN` | For legacy | Static API token (fallback) |
+| `TEMPO_BASE_URL` | No | API base URL (default: `https://api.tempo.io`) |
+| `PORT` | No | HTTP port (default: `3000`) |
 
 ## Features
 
-- OAuth 2.0 Authorization Code flow with automatic token refresh
+- 253 tools covering all Tempo API v4 endpoints
+- OAuth 2.0 with automatic token refresh
+- Streamable HTTP transport for remote MCP
 - Backwards-compatible with static API tokens
-- 250+ tools covering all Tempo API endpoints
-- Zod schema validation for all tool inputs
+- Docker-ready for any platform

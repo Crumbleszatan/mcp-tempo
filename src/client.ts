@@ -1,6 +1,3 @@
-import { StoredTokens, loadTokens, saveTokens } from "./token-store.js";
-import { OAuthConfig, refreshAccessToken } from "./oauth.js";
-
 export interface RequestOptions {
   method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
   path: string;
@@ -10,59 +7,14 @@ export interface RequestOptions {
 
 export class TempoClient {
   private baseUrl: string;
-  private tokens: StoredTokens | null;
-  private oauthConfig: OAuthConfig | null;
-  // Fallback: static API token (backwards-compatible)
-  private staticToken: string | null;
+  private token: string;
 
-  constructor(opts: {
-    baseUrl: string;
-    tokens?: StoredTokens | null;
-    oauthConfig?: OAuthConfig | null;
-    staticToken?: string | null;
-  }) {
+  constructor(opts: { baseUrl: string; staticToken: string }) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, "");
-    this.tokens = opts.tokens ?? null;
-    this.oauthConfig = opts.oauthConfig ?? null;
-    this.staticToken = opts.staticToken ?? null;
-  }
-
-  /**
-   * Ensure we have a valid access token, refreshing if expired.
-   */
-  private async getAccessToken(): Promise<string> {
-    // Static token mode (backwards-compat)
-    if (this.staticToken) {
-      return this.staticToken;
-    }
-
-    if (!this.tokens) {
-      throw new Error(
-        "No OAuth tokens available. Run `npm run auth` to authenticate first."
-      );
-    }
-
-    // Refresh if token expires within 60 seconds
-    const bufferMs = 60 * 1000;
-    if (Date.now() >= this.tokens.expires_at - bufferMs) {
-      if (!this.oauthConfig) {
-        throw new Error(
-          "OAuth config missing — cannot refresh token. Set TEMPO_CLIENT_ID and TEMPO_CLIENT_SECRET."
-        );
-      }
-      console.error("Access token expired, refreshing...");
-      this.tokens = await refreshAccessToken(
-        this.oauthConfig,
-        this.tokens.refresh_token
-      );
-      console.error("Token refreshed successfully.");
-    }
-
-    return this.tokens.access_token;
+    this.token = opts.staticToken;
   }
 
   async request<T = unknown>(options: RequestOptions): Promise<T> {
-    const token = await this.getAccessToken();
     const url = new URL(`${this.baseUrl}${options.path}`);
 
     if (options.query) {
@@ -79,7 +31,7 @@ export class TempoClient {
     }
 
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${this.token}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     };
@@ -89,11 +41,7 @@ export class TempoClient {
       headers,
     };
 
-    if (
-      options.body &&
-      options.method !== "GET" &&
-      options.method !== "DELETE"
-    ) {
+    if (options.body && options.method !== "GET" && options.method !== "DELETE") {
       fetchOptions.body = JSON.stringify(options.body);
     }
 
@@ -118,28 +66,6 @@ export class TempoClient {
     }
 
     if (!response.ok) {
-      // If 401, token might be invalid — clear and signal
-      if (response.status === 401 && this.tokens && this.oauthConfig) {
-        console.error("Got 401 — attempting token refresh...");
-        try {
-          this.tokens = await refreshAccessToken(
-            this.oauthConfig,
-            this.tokens.refresh_token
-          );
-          // Retry once
-          headers.Authorization = `Bearer ${this.tokens.access_token}`;
-          const retryResponse = await fetch(url.toString(), {
-            ...fetchOptions,
-            headers,
-          });
-          const retryText = await retryResponse.text();
-          if (retryResponse.ok) {
-            return retryText ? JSON.parse(retryText) : ({ success: true } as T);
-          }
-        } catch {
-          // Refresh also failed
-        }
-      }
       throw new Error(
         `Tempo API error (${response.status}): ${JSON.stringify(data)}`
       );
