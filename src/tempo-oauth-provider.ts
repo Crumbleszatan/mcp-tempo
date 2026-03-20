@@ -108,6 +108,8 @@ export class TempoOAuthProvider implements OAuthServerProvider {
       state: params.state,
     });
 
+    console.error(`[OAuth] authorize: stored authCode=${ourCode}, redirectUri=${params.redirectUri}, state=${params.state}`);
+
     // Redirect to Tempo OAuth, with OUR callback as redirect_uri
     // We pass ourCode in the state so we can link Tempo's response back
     const tempoAuthUrl = new URL(
@@ -309,6 +311,7 @@ export function handleTempoCallback(
   tempoCode: string,
   state: string // our auth code
 ): { redirectUri: string } | { error: string } {
+  console.error(`[OAuth] callback: state=${state}, authCodes.size=${authCodes.size}, keys=[${[...authCodes.keys()].join(", ")}]`);
   const stored = authCodes.get(state);
   if (!stored) {
     return { error: "Invalid state parameter — authorization flow not found." };
