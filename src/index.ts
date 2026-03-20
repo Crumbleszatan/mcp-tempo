@@ -88,6 +88,7 @@ const oauthProvider = new TempoOAuthProvider();
 
 // --- Express App ---
 const app = express();
+app.set("trust proxy", 1); // Railway runs behind a reverse proxy
 
 // CORS
 app.use((_req, res, next) => {
