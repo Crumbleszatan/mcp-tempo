@@ -5,10 +5,16 @@ import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { TempoClient } from "./client.js";
 import { ToolDefinition } from "./tools/types.js";
-import { OAuthConfig, getAuthorizationUrl, exchangeCodeForTokens, refreshAccessToken } from "./oauth.js";
-import { getSession, setSession, deleteSession } from "./session-store.js";
+import {
+  TempoOAuthProvider,
+  handleTempoCallback,
+  getTempoTokenForMcpToken,
+} from "./tempo-oauth-provider.js";
 
 // Import all tool modules
 import { worklogTools } from "./tools/worklogs.js";
@@ -47,19 +53,7 @@ const allTools: ToolDefinition[] = [
 // --- Config ---
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const TEMPO_BASE_URL = process.env.TEMPO_BASE_URL || "https://api.tempo.io";
-const CLIENT_ID = process.env.TEMPO_CLIENT_ID || "";
-const CLIENT_SECRET = process.env.TEMPO_CLIENT_SECRET || "";
-const JIRA_INSTANCE = process.env.TEMPO_JIRA_INSTANCE || "";
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
-const REDIRECT_URI = `${PUBLIC_URL}/oauth/callback`;
-
-const oauthConfig: OAuthConfig = {
-  clientId: CLIENT_ID,
-  clientSecret: CLIENT_SECRET,
-  redirectUri: REDIRECT_URI,
-  jiraCloudInstance: JIRA_INSTANCE,
-  tempoBaseUrl: TEMPO_BASE_URL,
-};
 
 // --- Register tools on a McpServer ---
 function registerTools(server: McpServer, client: TempoClient) {
@@ -89,54 +83,11 @@ function registerTools(server: McpServer, client: TempoClient) {
 // --- MCP transports keyed by session ID ---
 const transports = new Map<string, StreamableHTTPServerTransport>();
 
-// --- Extract bearer token ---
-function getBearerToken(req: Request): string | null {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith("Bearer ")) return null;
-  return auth.slice(7);
-}
-
-// --- Resolve Tempo access token from request ---
-async function resolveTempoToken(req: Request, res: Response): Promise<string | null> {
-  const staticToken = process.env.TEMPO_API_TOKEN;
-
-  // In single-tenant mode (TEMPO_API_TOKEN set), skip auth check
-  if (staticToken) return staticToken;
-
-  const bearerToken = getBearerToken(req);
-
-  if (bearerToken) {
-    const session = getSession(bearerToken);
-    if (session) {
-      // Refresh if needed
-      if (Date.now() >= session.expiresAt - 60_000 && CLIENT_ID && CLIENT_SECRET) {
-        try {
-          const refreshed = await refreshAccessToken(oauthConfig, session.refreshToken);
-          session.accessToken = refreshed.access_token;
-          session.refreshToken = refreshed.refresh_token;
-          session.expiresAt = refreshed.expires_at;
-          setSession(bearerToken, session);
-        } catch {
-          deleteSession(bearerToken);
-          res.status(401).json({ error: "Token refresh failed. Re-authorize at /oauth/authorize" });
-          return null;
-        }
-      }
-      return session.accessToken;
-    }
-  }
-
-  if (staticToken) return staticToken;
-
-  res.status(401).json({
-    error: "Unauthorized. Provide a Bearer token from /oauth/callback or set TEMPO_API_TOKEN.",
-  });
-  return null;
-}
+// --- OAuth provider ---
+const oauthProvider = new TempoOAuthProvider();
 
 // --- Express App ---
 const app = express();
-app.use(express.json());
 
 // CORS
 app.use((_req, res, next) => {
@@ -148,7 +99,49 @@ app.use((_req, res, next) => {
 });
 app.options("/{*splat}", (_req, res) => res.sendStatus(204));
 
-// ============ HEALTH ============
+// --- MCP OAuth auth routes (/.well-known/*, /authorize, /token, /register) ---
+app.use(
+  mcpAuthRouter({
+    provider: oauthProvider,
+    issuerUrl: new URL(PUBLIC_URL),
+    baseUrl: new URL(PUBLIC_URL),
+    serviceDocumentationUrl: new URL("https://github.com/Crumbleszatan/mcp-tempo"),
+    scopesSupported: ["read", "write"],
+  })
+);
+
+// --- Tempo OAuth callback (receives redirect from Tempo after user authorizes) ---
+app.get("/oauth/callback", (req: Request, res: Response) => {
+  const code = req.query.code as string | undefined;
+  const state = req.query.state as string | undefined;
+  const error = req.query.error as string | undefined;
+
+  if (error) {
+    res.status(400).send(`<h1>Authorization failed</h1><p>${error}</p>`);
+    return;
+  }
+
+  if (!code || !state) {
+    res.status(400).json({ error: "Missing code or state parameter" });
+    return;
+  }
+
+  const result = handleTempoCallback(code, state);
+
+  if ("error" in result) {
+    res.status(400).send(`<h1>Error</h1><p>${result.error}</p>`);
+    return;
+  }
+
+  res.redirect(result.redirectUri);
+});
+
+// --- Bearer auth middleware for MCP endpoints ---
+const authMiddleware = requireBearerAuth({
+  verifier: oauthProvider,
+});
+
+// --- Health ---
 app.get("/", (_req, res) => {
   res.json({
     name: "mcp-tempo",
@@ -157,83 +150,21 @@ app.get("/", (_req, res) => {
     tools: allTools.length,
     endpoints: {
       mcp: `${PUBLIC_URL}/mcp`,
-      authorize: `${PUBLIC_URL}/oauth/authorize`,
-      status: `${PUBLIC_URL}/oauth/status`,
+      authorize: `${PUBLIC_URL}/authorize`,
     },
   });
 });
 
-// ============ OAUTH ENDPOINTS ============
+// --- MCP Endpoints (protected by OAuth) ---
 
-app.get("/oauth/authorize", (_req, res) => {
-  if (!CLIENT_ID || !JIRA_INSTANCE) {
-    res.status(500).json({ error: "TEMPO_CLIENT_ID and TEMPO_JIRA_INSTANCE not configured" });
+app.post("/mcp", authMiddleware, async (req: Request, res: Response) => {
+  const authInfo = (req as Request & { auth: AuthInfo }).auth;
+  const tempoToken = getTempoTokenForMcpToken(authInfo.token);
+
+  if (!tempoToken) {
+    res.status(401).json({ error: "Tempo token not found for this session" });
     return;
   }
-  const authUrl = getAuthorizationUrl(oauthConfig);
-  res.redirect(authUrl);
-});
-
-app.get("/oauth/callback", async (req, res) => {
-  const code = req.query.code as string | undefined;
-  const error = req.query.error as string | undefined;
-
-  if (error) {
-    res.status(400).send(`<h1>Authorization failed</h1><p>${error}</p>`);
-    return;
-  }
-
-  if (!code) {
-    res.status(400).json({ error: "Missing authorization code" });
-    return;
-  }
-
-  try {
-    const tokens = await exchangeCodeForTokens(oauthConfig, code);
-    const sessionToken = randomUUID();
-    setSession(sessionToken, {
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      expiresAt: tokens.expires_at,
-    });
-
-    res.send(`
-      <h1>Authorization successful!</h1>
-      <p>Your session token (use as Bearer token for MCP):</p>
-      <pre style="background:#f0f0f0;padding:12px;border-radius:6px;word-break:break-all">${sessionToken}</pre>
-      <p>Configure your MCP client with:</p>
-      <pre style="background:#f0f0f0;padding:12px;border-radius:6px">URL: ${PUBLIC_URL}/mcp\nAuthorization: Bearer ${sessionToken}</pre>
-      <p>You can close this window.</p>
-    `);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : "Token exchange failed" });
-  }
-});
-
-app.get("/oauth/status", (req, res) => {
-  const token = getBearerToken(req);
-  if (!token) {
-    res.status(401).json({ error: "Missing Bearer token" });
-    return;
-  }
-  const session = getSession(token);
-  if (!session) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-  res.json({
-    authenticated: true,
-    expiresAt: new Date(session.expiresAt).toISOString(),
-    expired: Date.now() >= session.expiresAt,
-  });
-});
-
-// ============ MCP ENDPOINT ============
-
-// POST /mcp — main MCP protocol handler
-app.post("/mcp", async (req, res) => {
-  const tempoToken = await resolveTempoToken(req, res);
-  if (!tempoToken) return;
 
   const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport = mcpSessionId ? transports.get(mcpSessionId) : undefined;
@@ -270,8 +201,7 @@ app.post("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// GET /mcp — SSE stream for server-to-client notifications
-app.get("/mcp", async (req, res) => {
+app.get("/mcp", authMiddleware, async (req: Request, res: Response) => {
   const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
   const transport = mcpSessionId ? transports.get(mcpSessionId) : undefined;
   if (!transport) {
@@ -281,8 +211,7 @@ app.get("/mcp", async (req, res) => {
   await transport.handleRequest(req, res);
 });
 
-// DELETE /mcp — close MCP session
-app.delete("/mcp", async (req, res) => {
+app.delete("/mcp", authMiddleware, async (req: Request, res: Response) => {
   const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
   const transport = mcpSessionId ? transports.get(mcpSessionId) : undefined;
   if (transport) {
@@ -294,7 +223,7 @@ app.delete("/mcp", async (req, res) => {
 
 // --- Error handler ---
 app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) => {
-  console.error("Express error:", err);
+  console.error("Server error:", err);
   res.status(500).json({ error: err.message });
 });
 
@@ -302,6 +231,6 @@ app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) 
 app.listen(PORT, "0.0.0.0", () => {
   console.error(`Tempo MCP server running on ${PUBLIC_URL}`);
   console.error(`  MCP endpoint: ${PUBLIC_URL}/mcp`);
-  console.error(`  OAuth authorize: ${PUBLIC_URL}/oauth/authorize`);
+  console.error(`  OAuth metadata: ${PUBLIC_URL}/.well-known/oauth-authorization-server`);
   console.error(`  Tools: ${allTools.length}`);
 });
