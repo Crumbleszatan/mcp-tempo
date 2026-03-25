@@ -1,5 +1,5 @@
 import { Response } from "express";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import {
   OAuthServerProvider,
   AuthorizationParams,
@@ -14,24 +14,58 @@ import {
   OAuthTokenRevocationRequest,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 
-// --- Tempo OAuth config ---
+// --- Config ---
 const TEMPO_CLIENT_ID = process.env.TEMPO_CLIENT_ID || "";
 const TEMPO_CLIENT_SECRET = process.env.TEMPO_CLIENT_SECRET || "";
 const TEMPO_JIRA_INSTANCE = process.env.TEMPO_JIRA_INSTANCE || "";
 const TEMPO_BASE_URL = process.env.TEMPO_BASE_URL || "https://api.tempo.io";
 const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
 
-// --- In-memory stores ---
+// HMAC key derived from client secret
+const HMAC_KEY = TEMPO_CLIENT_SECRET || "default-key";
 
-// Map: authorization code -> { codeChallenge, redirectUri, tempoCode }
-const authCodes = new Map<string, {
+// --- Signed state encoding (no in-memory storage needed) ---
+
+interface StatePayload {
   codeChallenge: string;
   redirectUri: string;
   clientId: string;
-  state?: string;
+  mcpState?: string;
+}
+
+function signState(payload: StatePayload): string {
+  const json = JSON.stringify(payload);
+  const data = Buffer.from(json).toString("base64url");
+  const sig = createHmac("sha256", HMAC_KEY).update(data).digest("base64url");
+  return `${data}.${sig}`;
+}
+
+function verifyState(state: string): StatePayload | null {
+  const parts = state.split(".");
+  if (parts.length !== 2) return null;
+  const [data, sig] = parts;
+  const expected = createHmac("sha256", HMAC_KEY).update(data).digest("base64url");
+  try {
+    if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(Buffer.from(data, "base64url").toString());
+  } catch {
+    return null;
+  }
+}
+
+// --- In-memory stores (only for short-lived data within single request flows) ---
+
+// Map: our auth code -> { tempoCode, payload } (lives from callback to token exchange, seconds)
+const pendingExchanges = new Map<string, {
+  tempoCode: string;
+  payload: StatePayload;
 }>();
 
-// Map: MCP access token -> Tempo access token + metadata
+// Map: MCP access token -> Tempo token data
 const accessTokens = new Map<string, {
   tempoAccessToken: string;
   tempoRefreshToken: string;
@@ -40,14 +74,11 @@ const accessTokens = new Map<string, {
   scopes: string[];
 }>();
 
-// Map: MCP refresh token -> MCP access token (for refresh flow)
+// Map: MCP refresh token -> MCP access token
 const refreshTokens = new Map<string, string>();
 
-// Map: our auth code -> Tempo auth code (from Tempo's redirect)
-const tempoAuthCodes = new Map<string, string>();
-
 /**
- * Clients store - accepts any client that registers via dynamic registration.
+ * Clients store - auto-registers and accepts any client.
  */
 export class TempoClientsStore implements OAuthRegisteredClientsStore {
   private clients = new Map<string, OAuthClientInformationFull>();
@@ -65,19 +96,14 @@ export class TempoClientsStore implements OAuthRegisteredClientsStore {
       client_id_issued_at: Math.floor(Date.now() / 1000),
     };
     this.clients.set(fullClient.client_id, fullClient);
+    console.error(`[OAuth] Client registered: ${fullClient.client_id} (${client.client_name || "unnamed"})`);
     return fullClient;
   }
 }
 
 /**
  * OAuth provider that proxies auth to Tempo's OAuth 2.0.
- *
- * Flow:
- * 1. Claude Desktop calls /authorize -> we redirect to Tempo's authorization page
- * 2. Tempo redirects back to our /oauth/callback with a Tempo auth code
- * 3. We store the Tempo code and redirect Claude Desktop's redirect_uri with our own code
- * 4. Claude Desktop exchanges our code for tokens via /token
- * 5. We exchange the Tempo code for Tempo tokens, wrap them, and return MCP tokens
+ * Uses signed state parameters to survive server restarts.
  */
 export class TempoOAuthProvider implements OAuthServerProvider {
   private _clientsStore = new TempoClientsStore();
@@ -86,39 +112,33 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     return this._clientsStore;
   }
 
-  // Skip local PKCE because we handle it ourselves with Tempo
   skipLocalPkceValidation = true;
 
   /**
-   * Step 1: Redirect to Tempo's authorization page.
-   * We store the MCP client's redirect_uri and state, then redirect to Tempo.
+   * Redirect to Tempo's auth page. All needed data is encoded in the state.
    */
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    // Generate our own auth code to track this flow
-    const ourCode = randomUUID();
-
-    authCodes.set(ourCode, {
+    const payload: StatePayload = {
       codeChallenge: params.codeChallenge,
       redirectUri: params.redirectUri,
       clientId: client.client_id,
-      state: params.state,
-    });
+      mcpState: params.state,
+    };
 
-    console.error(`[OAuth] authorize: stored authCode=${ourCode}, redirectUri=${params.redirectUri}, state=${params.state}`);
+    const signedState = signState(payload);
+    console.error(`[OAuth] authorize: clientId=${client.client_id}, redirectUri=${params.redirectUri}`);
 
-    // Redirect to Tempo OAuth, with OUR callback as redirect_uri
-    // We pass ourCode in the state so we can link Tempo's response back
     const tempoAuthUrl = new URL(
       `https://${TEMPO_JIRA_INSTANCE}.atlassian.net/plugins/servlet/ac/io.tempo.jira/oauth-authorize/`
     );
     tempoAuthUrl.searchParams.set("client_id", TEMPO_CLIENT_ID);
     tempoAuthUrl.searchParams.set("redirect_uri", `${PUBLIC_URL}/oauth/callback`);
     tempoAuthUrl.searchParams.set("access_type", "tenant_user");
-    tempoAuthUrl.searchParams.set("state", ourCode);
+    tempoAuthUrl.searchParams.set("state", signedState);
 
     res.redirect(tempoAuthUrl.toString());
   }
@@ -127,14 +147,13 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<string> {
-    const stored = authCodes.get(authorizationCode);
-    if (!stored) throw new Error("Unknown authorization code");
-    return stored.codeChallenge;
+    const pending = pendingExchanges.get(authorizationCode);
+    if (!pending) throw new Error("Unknown authorization code");
+    return pending.payload.codeChallenge;
   }
 
   /**
-   * Step 4: Exchange our auth code for tokens.
-   * Behind the scenes, we exchange the Tempo code for Tempo tokens.
+   * Exchange our auth code for tokens by exchanging Tempo's code behind the scenes.
    */
   async exchangeAuthorizationCode(
     _client: OAuthClientInformationFull,
@@ -142,20 +161,17 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     _codeVerifier?: string,
     _redirectUri?: string
   ): Promise<OAuthTokens> {
-    const stored = authCodes.get(authorizationCode);
-    if (!stored) throw new Error("Unknown authorization code");
+    const pending = pendingExchanges.get(authorizationCode);
+    if (!pending) throw new Error("Unknown authorization code");
 
-    // Get the Tempo auth code that was stored during callback
-    const tempoCode = tempoAuthCodes.get(authorizationCode);
-    if (!tempoCode) throw new Error("Tempo authorization code not found. The OAuth callback may not have completed.");
+    console.error(`[OAuth] exchangeCode: exchanging Tempo code for tokens`);
 
-    // Exchange Tempo code for Tempo tokens
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: TEMPO_CLIENT_ID,
       client_secret: TEMPO_CLIENT_SECRET,
       redirect_uri: `${PUBLIC_URL}/oauth/callback`,
-      code: tempoCode,
+      code: pending.tempoCode,
     });
 
     const response = await fetch(`${TEMPO_BASE_URL}/oauth/token/`, {
@@ -176,7 +192,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
       token_type: string;
     };
 
-    // Create MCP tokens that wrap Tempo tokens
     const mcpAccessToken = randomUUID();
     const mcpRefreshToken = randomUUID();
 
@@ -184,15 +199,14 @@ export class TempoOAuthProvider implements OAuthServerProvider {
       tempoAccessToken: tempoTokens.access_token,
       tempoRefreshToken: tempoTokens.refresh_token,
       tempoExpiresAt: Date.now() + tempoTokens.expires_in * 1000,
-      clientId: stored.clientId,
+      clientId: pending.payload.clientId,
       scopes: ["read", "write"],
     });
 
     refreshTokens.set(mcpRefreshToken, mcpAccessToken);
+    pendingExchanges.delete(authorizationCode);
 
-    // Cleanup
-    authCodes.delete(authorizationCode);
-    tempoAuthCodes.delete(authorizationCode);
+    console.error(`[OAuth] Token exchange successful`);
 
     return {
       access_token: mcpAccessToken,
@@ -202,9 +216,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  /**
-   * Refresh: exchange MCP refresh token for new tokens, refreshing Tempo tokens too.
-   */
   async exchangeRefreshToken(
     _client: OAuthClientInformationFull,
     refreshToken: string
@@ -215,7 +226,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     const stored = accessTokens.get(mcpAccessToken);
     if (!stored) throw new Error("Associated access token not found");
 
-    // Refresh Tempo token
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       client_id: TEMPO_CLIENT_ID,
@@ -240,7 +250,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
       expires_in: number;
     };
 
-    // Create new MCP tokens
     const newMcpAccessToken = randomUUID();
     const newMcpRefreshToken = randomUUID();
 
@@ -253,8 +262,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     });
 
     refreshTokens.set(newMcpRefreshToken, newMcpAccessToken);
-
-    // Cleanup old tokens
     accessTokens.delete(mcpAccessToken);
     refreshTokens.delete(refreshToken);
 
@@ -266,9 +273,6 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  /**
-   * Verify an MCP access token and return the associated Tempo access token.
-   */
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const stored = accessTokens.get(token);
     if (!stored) {
@@ -291,9 +295,7 @@ export class TempoOAuthProvider implements OAuthServerProvider {
     request: OAuthTokenRevocationRequest
   ): Promise<void> {
     const token = request.token;
-    if (accessTokens.has(token)) {
-      accessTokens.delete(token);
-    }
+    if (accessTokens.has(token)) accessTokens.delete(token);
     if (refreshTokens.has(token)) {
       const associated = refreshTokens.get(token);
       if (associated) accessTokens.delete(associated);
@@ -304,27 +306,34 @@ export class TempoOAuthProvider implements OAuthServerProvider {
 
 /**
  * Handle the Tempo OAuth callback.
- * Called when Tempo redirects back after user authorization.
- * Links the Tempo auth code to our internal auth code, then redirects to the MCP client.
+ * Decodes the signed state, stores the Tempo code, redirects to Claude Desktop.
  */
 export function handleTempoCallback(
   tempoCode: string,
-  state: string // our auth code
+  state: string
 ): { redirectUri: string } | { error: string } {
-  console.error(`[OAuth] callback: state=${state}, authCodes.size=${authCodes.size}, keys=[${[...authCodes.keys()].join(", ")}]`);
-  const stored = authCodes.get(state);
-  if (!stored) {
-    return { error: "Invalid state parameter — authorization flow not found." };
+  console.error(`[OAuth] callback received, verifying signed state...`);
+
+  const payload = verifyState(state);
+  if (!payload) {
+    console.error(`[OAuth] callback: INVALID signed state`);
+    return { error: "Invalid or tampered state parameter." };
   }
 
-  // Store the Tempo code, linked to our auth code
-  tempoAuthCodes.set(state, tempoCode);
+  console.error(`[OAuth] callback: valid state for clientId=${payload.clientId}`);
 
-  // Redirect to the MCP client's redirect_uri with our auth code
-  const redirectUrl = new URL(stored.redirectUri);
-  redirectUrl.searchParams.set("code", state);
-  if (stored.state) {
-    redirectUrl.searchParams.set("state", stored.state);
+  // Generate an auth code for the MCP client
+  const ourCode = randomUUID();
+  pendingExchanges.set(ourCode, { tempoCode, payload });
+
+  // Auto-cleanup after 5 minutes
+  setTimeout(() => pendingExchanges.delete(ourCode), 5 * 60 * 1000);
+
+  // Redirect to Claude Desktop's callback
+  const redirectUrl = new URL(payload.redirectUri);
+  redirectUrl.searchParams.set("code", ourCode);
+  if (payload.mcpState) {
+    redirectUrl.searchParams.set("state", payload.mcpState);
   }
 
   return { redirectUri: redirectUrl.toString() };
