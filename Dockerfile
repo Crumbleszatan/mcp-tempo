@@ -1,16 +1,29 @@
-FROM node:22-alpine
-
+# ─── Stage 1 : Build ──────────────────────────────────────────────────────────
+FROM node:18-alpine AS builder
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --production=false
+# Install all dependencies (including devDependencies for TypeScript)
+COPY package*.json ./
+RUN npm ci
 
+# Compile TypeScript
 COPY tsconfig.json ./
-COPY src ./src
+COPY src/ ./src/
 RUN npm run build
 
-RUN npm prune --production
+# Prune to production dependencies only
+RUN npm ci --omit=dev
 
+# ─── Stage 2 : Runtime ────────────────────────────────────────────────────────
+FROM node:18-alpine AS runtime
+WORKDIR /app
+
+# Copy compiled output and production node_modules
+COPY --from=builder /app/dist        ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json  ./package.json
+
+# Railway injects PORT automatically — default fallback for local docker run
 EXPOSE 3000
 
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/server.js"]
