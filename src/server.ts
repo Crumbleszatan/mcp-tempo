@@ -35,7 +35,10 @@ const MAX_STATE_LENGTH = 512;
 
 // [SEC-M3] Maximum idle lifetime for an MCP session before it is force-purged.
 // Prevents stale sessions (from crashed clients) from permanently exhausting MAX_SESSIONS.
-const SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+// Configurable via SESSION_TTL_MS env var (milliseconds) — default 24 hours.
+// Railway restarts containers and kills idle SSE streams; a longer TTL reduces forced re-auths.
+const SESSION_TTL_MS =
+  parseInt(process.env["SESSION_TTL_MS"] ?? "", 10) || 24 * 60 * 60 * 1000;
 
 // ─── MCP server factory ───────────────────────────────────────────────────────
 // One McpServer instance per StreamableHTTP session — required by the SDK.
@@ -385,12 +388,28 @@ app.all("/mcp", mcpLimiter, async (req: Request, res: Response): Promise<void> =
       return;
     }
     sessionLastActive.set(sessionId, Date.now()); // [SEC-M3] refresh activity timestamp
+
+    // [KEEP-ALIVE] For SSE streams (GET), emit an SSE comment every 25 seconds.
+    // Railway's reverse proxy closes idle long-lived HTTP connections after ~30s.
+    // A keep-alive comment keeps the TCP connection alive without affecting the
+    // MCP protocol (SSE comments starting with ":" are ignored by clients).
+    let heartbeatInterval: NodeJS.Timeout | undefined;
+    if (req.method === "GET") {
+      heartbeatInterval = setInterval(() => {
+        if (!res.writableEnded && res.headersSent) {
+          res.write(": keep-alive\n\n");
+        }
+      }, 25_000);
+    }
+
     // [SEC-M7] Express 4 doesn't catch async errors — an unhandled rejection crashes Node.js 18.
     try {
       await tokenContext.run(token, () => transport.handleRequest(req, res, req.body));
     } catch (err) {
       console.error("[mcp] Transport error on existing session:", err);
       if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+    } finally {
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
     }
     return;
   }
